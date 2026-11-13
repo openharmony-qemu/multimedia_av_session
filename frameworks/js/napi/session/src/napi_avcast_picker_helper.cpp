@@ -21,7 +21,7 @@
 namespace OHOS::AVSession {
 
 static const std::string ABILITY_WANT_PARAMS_UIEXTENSIONTARGETTYPE = "ability.want.params.uiExtensionType";
-static const std::string ABILITY_WANT_ELEMENT_NAME = "com.ohos.mediacontroller";
+static const std::string ABILITY_WANT_ELEMENT_NAME = "com.hmos.mediacontroller";
 
 static __thread napi_ref AVCastPickerHelperConstructorRef = nullptr;
 std::map<std::string, std::pair<NapiAVCastPickerHelper::OnEventHandlerType,
@@ -32,6 +32,7 @@ std::map<std::string, std::pair<NapiAVCastPickerHelper::OnEventHandlerType,
 NapiAVCastPickerHelper::NapiAVCastPickerHelper(Ace::UIContent* uiContent)
 {
     SLOGI("construct");
+    SLOGI("AVPicker lifetime helper=%{public}p phase=construct", static_cast<void*>(this));
     uiContent_ = uiContent;
     isValid_ = std::make_shared<bool>(true);
     audioRoutingMngr_ = AudioStandard::AudioRoutingManager::GetInstance();
@@ -41,6 +42,7 @@ NapiAVCastPickerHelper::~NapiAVCastPickerHelper()
 {
     SLOGI("destroy.");
     *isValid_ = false;
+    SLOGI("AVPicker lifetime helper=%{public}p phase=destroy", static_cast<void*>(this));
 }
 
 napi_value NapiAVCastPickerHelper::Init(napi_env env, napi_value exports)
@@ -222,7 +224,7 @@ napi_value NapiAVCastPickerHelper::SelectAVPicker(napi_env env, napi_callback_in
         auto extensionCallback = CreateExtensionCallback(callback, napiAVCastPickerHelper);
 
         Ace::ModalUIExtensionConfig config;
-        config.isProhibitBack = true;
+        config.isProhibitBack = false;
         CHECK_AND_RETURN_LOG(napiAVCastPickerHelper->uiContent_ != nullptr, "uiContent_ is destroyed");
         napiAVCastPickerHelper->sessionId_ =
             napiAVCastPickerHelper->uiContent_->CreateModalUIExtension(request, extensionCallback, config);
@@ -234,9 +236,10 @@ napi_value NapiAVCastPickerHelper::SelectAVPicker(napi_env env, napi_callback_in
 
 void NapiAVCastPickerHelper::BuildPickerRequest(const NapiAVCastPickerOptions& options, AAFwk::Want& request)
 {
-    std::string targetType = "sysPicker/mediaControl";
+    std::string targetType = "sys/commonUI";
     request.SetParam(ABILITY_WANT_PARAMS_UIEXTENSIONTARGETTYPE, targetType);
     request.SetParam("isAVCastPickerHelper", true);
+    request.SetParam("isCustomPicker", false);
     request.SetParam("AVCastPickerOptionsType", options.sessionType);
     request.SetParam("AVCastPickerOptionsStyle", options.pickerStyle);
     request.SetParam("AVCastPickerOptionsPositionX", options.menuPosition.x);
@@ -251,21 +254,56 @@ Ace::ModalUIExtensionCallbacks NapiAVCastPickerHelper::CreateExtensionCallback(
 {
     static const std::string callBackName = "NapiAVCastPickerHelper::SelectAVPicker";
     auto isValid = napiAVCastPickerHelper->isValid_;
+    auto generationToken = napiAVCastPickerHelper->pickerGeneration_;
+    const uint64_t generation = generationToken->fetch_add(1) + 1;
+    SLOGI("AVPicker generation helper=%{public}p generation=%{public}llu",
+        static_cast<void*>(napiAVCastPickerHelper), static_cast<unsigned long long>(generation));
+    auto pickerState = std::make_shared<std::atomic<int32_t>>(-1);
+    auto notifyState = [napiAVCastPickerHelper, isValid, generationToken, generation, pickerState](int32_t state) {
+        CHECK_AND_RETURN_LOG(isValid && *isValid, "NapiAVCastPickerHelper is destroyed");
+        CHECK_AND_RETURN_LOG(generationToken->load() == generation, "Ignoring an older picker session");
+        int32_t previous = pickerState->load();
+        // Each modal session can appear once and disappear once. A terminal
+        // close cannot be reopened by a delayed remote-ready/provider callback.
+        while (previous != state && previous != static_cast<int32_t>(STATE_DISAPPEARING)) {
+            if (pickerState->compare_exchange_weak(previous, state)) {
+                CHECK_AND_RETURN_LOG(isValid && *isValid, "NapiAVCastPickerHelper is destroyed");
+                CHECK_AND_RETURN_LOG(generationToken->load() == generation, "Ignoring an older picker session");
+                SLOGI("AVPicker state helper=%{public}p generation=%{public}llu state=%{public}d",
+                    static_cast<void*>(napiAVCastPickerHelper), static_cast<unsigned long long>(generation), state);
+                napiAVCastPickerHelper->HandleEvent(EVENT_PICPKER_STATE_CHANGE, callBackName, state, generation);
+                return;
+            }
+        }
+    };
     return {
-        .onRelease = ([callback](auto arg) { callback->OnRelease(arg); }),
+        .onRelease = ([callback, notifyState](auto arg) {
+            // The callback still owns and closes this actual modal session,
+            // even when its generation no longer owns the helper's events.
+            callback->OnRelease(arg);
+            notifyState(STATE_DISAPPEARING);
+        }),
         .onResult = ([callback](auto arg1, auto arg2) { callback->OnResult(arg1, arg2); }),
-        .onReceive = ([callback, napiAVCastPickerHelper, isValid](auto arg) {
+        .onReceive = ([callback, notifyState](auto arg) {
             callback->OnReceive(arg);
-            CHECK_AND_RETURN_LOG(isValid && *isValid, "NapiAVCastPickerHelper is destroyed");
-            napiAVCastPickerHelper->HandleEvent(EVENT_PICPKER_STATE_CHANGE, callBackName, STATE_DISAPPEARING);
+            AAFwk::Want stateWant;
+            stateWant.SetParams(arg);
+            const int32_t state = stateWant.GetIntParam("state", -1);
+            if (state == static_cast<int32_t>(STATE_APPEARING) ||
+                state == static_cast<int32_t>(STATE_DISAPPEARING)) {
+                notifyState(state);
+            }
         }),
         .onError = ([callback](auto arg1, auto arg2, auto arg3) { callback->OnError(arg1, arg2, arg3); }),
-        .onRemoteReady = ([callback, napiAVCastPickerHelper, isValid](auto arg) {
+        .onRemoteReady = ([callback](auto arg) {
+            // Proxy readiness does not prove that the provider's panel is
+            // visible. Its actual sendData({state: 0}) owns APPEARING.
             callback->OnRemoteReady(arg);
-            CHECK_AND_RETURN_LOG(isValid && *isValid, "NapiAVCastPickerHelper is destroyed");
-            napiAVCastPickerHelper->HandleEvent(EVENT_PICPKER_STATE_CHANGE, callBackName, STATE_APPEARING);
         }),
-        .onDestroy = ([callback]() { callback->OnDestroy(); }),
+        .onDestroy = ([callback, notifyState]() {
+            callback->OnDestroy();
+            notifyState(STATE_DISAPPEARING);
+        }),
     };
 }
 
@@ -314,28 +352,56 @@ napi_status NapiAVCastPickerHelper::OffPickerStateChange(napi_env env, NapiAVCas
 }
 
 template<typename T>
-void NapiAVCastPickerHelper::HandleEvent(int32_t event, std::string callBackName, const T& param)
+void NapiAVCastPickerHelper::HandleEvent(int32_t event, std::string callBackName, const T& param, uint64_t generation)
 {
     std::lock_guard<std::mutex> lockGuard(lock_);
+    const auto generationToken = pickerGeneration_;
+    CHECK_AND_RETURN_LOG(generationToken->load() == generation, "Ignoring an older picker event");
     if (callbacks_[event].empty()) {
         SLOGE("pickerNotRegister:%{public}d", event);
         return;
     }
     for (auto ref = callbacks_[event].begin(); ref != callbacks_[event].end(); ++ref) {
-        asyncCallback_->CallWithFunc(*ref, isValid_,
-            [this, ref, event]() {
+        const auto registered = callbackRefs_.find(*ref);
+        if (registered == callbackRefs_.end()) {
+            continue;
+        }
+        const auto callbackRef = registered->second;
+        // DataContextWithFunc retains napi_ref&; its check owns this cell.
+        SLOGI("AVPicker queue helper=%{public}p generation=%{public}llu ref=%{public}p cell=%{public}p",
+            static_cast<void*>(this), static_cast<unsigned long long>(generation),
+            static_cast<void*>(*callbackRef), static_cast<void*>(callbackRef.get()));
+        asyncCallback_->CallWithFunc(*callbackRef, isValid_,
+            [this, callbackRef, event, generationToken, generation]() {
                 std::lock_guard<std::mutex> lockGuard(lock_);
+                if (generationToken->load() != generation) {
+                    SLOGI("Ignoring an older queued picker event");
+                    SLOGI("AVPicker reject helper=%{public}p generation=%{public}llu ref=%{public}p cell=%{public}p reason=generation",
+                        static_cast<void*>(this), static_cast<unsigned long long>(generation),
+                        static_cast<void*>(*callbackRef), static_cast<void*>(callbackRef.get()));
+                    return false;
+                }
+                const auto registered = callbackRefs_.find(*callbackRef);
+                if (registered == callbackRefs_.end() || registered->second != callbackRef) {
+                    SLOGI("AVPicker reject helper=%{public}p generation=%{public}llu ref=%{public}p cell=%{public}p reason=registration",
+                        static_cast<void*>(this), static_cast<unsigned long long>(generation),
+                        static_cast<void*>(*callbackRef), static_cast<void*>(callbackRef.get()));
+                    return false;
+                }
                 if (callbacks_[event].empty()) {
                     SLOGE("checkCallbackValid with empty list for event=%{public}d", event);
                     return false;
                 }
                 bool hasFunc = false;
                 for (auto it = callbacks_[event].begin(); it != callbacks_[event].end(); ++it) {
-                    hasFunc = (ref == it ? true : hasFunc);
+                    hasFunc = (*callbackRef == *it ? true : hasFunc);
                 }
                 if (!hasFunc) {
                     SLOGE("checkCallbackValid res false for event=%{public}d", event);
                 }
+                SLOGI("AVPicker checked helper=%{public}p generation=%{public}llu ref=%{public}p cell=%{public}p present=%{public}d",
+                    static_cast<void*>(this), static_cast<unsigned long long>(generation),
+                    static_cast<void*>(*callbackRef), static_cast<void*>(callbackRef.get()), hasFunc);
                 return hasFunc;
             }, callBackName,
             [param](napi_env env, int& argc, napi_value* argv) {
@@ -366,7 +432,11 @@ napi_status NapiAVCastPickerHelper::AddCallback(napi_env env, int32_t event, nap
             return napi_generic_failure;
         }
     }
+    const auto callbackRef = std::make_shared<napi_ref>(ref);
+    callbackRefs_.emplace(ref, callbackRef);
     callbacks_[event].push_back(ref);
+    SLOGI("AVPicker registered helper=%{public}p ref=%{public}p cell=%{public}p",
+        static_cast<void*>(this), static_cast<void*>(ref), static_cast<void*>(callbackRef.get()));
     return napi_ok;
 }
 
@@ -376,9 +446,15 @@ napi_status NapiAVCastPickerHelper::RemoveCallback(napi_env env, int32_t event, 
     std::lock_guard<std::mutex> lockGuard(lock_);
     CHECK_AND_RETURN_RET_LOG(event == EVENT_PICPKER_STATE_CHANGE, napi_generic_failure, "has no event");
     if (callback == nullptr) {
-        for (auto callbackRef = callbacks_[event].begin(); callbackRef != callbacks_[event].end(); ++callbackRef) {
+        for (auto callbackRef = callbacks_[event].begin(); callbackRef != callbacks_[event].end();) {
             napi_status ret = napi_delete_reference(env, *callbackRef);
+            const auto registered = callbackRefs_.find(*callbackRef);
+            SLOGI("AVPicker removed helper=%{public}p ref=%{public}p cell=%{public}p status=%{public}d",
+                static_cast<void*>(this), static_cast<void*>(*callbackRef),
+                registered == callbackRefs_.end() ? nullptr : static_cast<void*>(registered->second.get()), ret);
             CHECK_AND_RETURN_RET_LOG(napi_ok == ret, ret, "delete callback reference failed");
+            callbackRefs_.erase(*callbackRef);
+            callbackRef = callbacks_[event].erase(callbackRef);
         }
         callbacks_[event].clear();
         return napi_ok;
@@ -388,7 +464,13 @@ napi_status NapiAVCastPickerHelper::RemoveCallback(napi_env env, int32_t event, 
                              napi_generic_failure, "get callback reference failed");
     CHECK_AND_RETURN_RET_LOG(ref != nullptr, napi_ok, "callback has been remove");
     callbacks_[event].remove(ref);
-    return napi_delete_reference(env, ref);
+    const auto registered = callbackRefs_.find(ref);
+    const auto removedCell = registered == callbackRefs_.end() ? nullptr : registered->second;
+    callbackRefs_.erase(ref);
+    const napi_status status = napi_delete_reference(env, ref);
+    SLOGI("AVPicker removed helper=%{public}p ref=%{public}p cell=%{public}p status=%{public}d",
+        static_cast<void*>(this), static_cast<void*>(ref), static_cast<void*>(removedCell.get()), status);
+    return status;
 }
 
 bool NapiAVCastPickerHelper::IsCallbacksEmpty(int32_t event)

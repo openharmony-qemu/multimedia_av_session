@@ -16,6 +16,11 @@
 #ifndef OHOS_NAPI_AVCAST_PICKER_HELPER_H
 #define OHOS_NAPI_AVCAST_PICKER_HELPER_H
 
+#include <atomic>
+#include <cstdint>
+#include <map>
+#include <memory>
+
 #include "napi/native_api.h"
 #include "napi/native_node_api.h"
 #include "avsession_log.h"
@@ -105,12 +110,15 @@ private:
     static std::map<std::string, std::pair<OnEventHandlerType, OffEventHandlerType>> eventHandlers_;
 
     template<typename T>
-    void HandleEvent(int32_t event, std::string callBackName, const T& param);
+    void HandleEvent(int32_t event, std::string callBackName, const T& param, uint64_t generation);
     
     std::mutex lock_;
     std::shared_ptr<NapiAsyncCallback> asyncCallback_;
     std::list<napi_ref> callbacks_[EVENT_TYPE_MAX] {};
+    // Queued checks own this stable cell, distinct for every registration.
+    std::map<napi_ref, std::shared_ptr<napi_ref>> callbackRefs_;
     std::shared_ptr<bool> isValid_;
+    std::shared_ptr<std::atomic<uint64_t>> pickerGeneration_ = std::make_shared<std::atomic<uint64_t>>(0);
 
     Ace::UIContent *uiContent_;
     napi_ref wrapperRef_{ nullptr };

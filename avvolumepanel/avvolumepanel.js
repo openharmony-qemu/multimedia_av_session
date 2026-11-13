@@ -60,7 +60,7 @@ export class AVVolumePanel extends ViewPU {
   purgeVariableDependenciesOnElmtId(m) {
     this.__volumeLevel.purgeDependencyOnElmtId(m);
     this.__volumeParameter.purgeDependencyOnElmtId(m);
-    this.__isDisabledByPanelLimit.purgeDependencyOnElmtId(a11);
+    this.__isDisabledByPanelLimit.purgeDependencyOnElmtId(m);
   }
 
   aboutToBeDeleted() {

@@ -14,12 +14,18 @@
  */
 
 #include <memory>
+#include <atomic>
+#include <cstdint>
 
 #include "avsession_trace.h"
 #include "napi_utils.h"
 #include "napi_async_callback.h"
 
 namespace OHOS::AVSession {
+namespace {
+std::atomic<uint64_t> callbackEventSequence { 0 };
+}
+
 NapiAsyncCallback::NapiAsyncCallback(napi_env env) : env_(env)
 {
     if (env != nullptr) {
@@ -47,16 +53,15 @@ void NapiAsyncCallback::Call(napi_ref& method, std::string callbackName, NapiArg
     CHECK_RETURN_VOID(loop_ != nullptr, "loop_ is nullptr");
     CHECK_RETURN_VOID(method != nullptr, "method is nullptr");
 
-    std::shared_ptr<uv_work_t> work = std::make_shared<uv_work_t>();
-    CHECK_RETURN_VOID(work != nullptr, "no memory for uv_work_t");
-
-    work->data = new DataContext{env_, method, std::move(getter)};
-    auto task = [work] {
-        AVSESSION_TRACE_SYNC_START("NapiAsyncCallback::Call");
-        std::shared_ptr<DataContext> context(static_cast<DataContext*>(work->data), [](DataContext* ptr) {
+    std::shared_ptr<DataContext> context(new DataContext{env_, method, std::move(getter)},
+        [](DataContext* ptr) {
             delete ptr;
             ptr = nullptr;
         });
+    CHECK_RETURN_VOID(context != nullptr, "no memory for uv_work_t");
+
+    auto task = [context] {
+        AVSESSION_TRACE_SYNC_START("NapiAsyncCallback::Call");
         if (context == nullptr) {
             SLOGE("context is nullptr");
             return;
@@ -93,17 +98,16 @@ void NapiAsyncCallback::CallWithFlag(napi_ref& method, std::shared_ptr<bool> isV
     CHECK_RETURN_VOID(loop_ != nullptr, "loop_ is nullptr");
     CHECK_RETURN_VOID(method != nullptr, "method is nullptr");
 
-    std::shared_ptr<uv_work_t> work = std::make_shared<uv_work_t>();
-    CHECK_RETURN_VOID(work != nullptr, "no memory for uv_work_t");
-
-    work->data = new DataContextWithFlag { env_, method, isValid, std::move(getter) };
-    auto task = [work] {
-        AVSESSION_TRACE_SYNC_START("NapiAsyncCallback::CallWithFlag");
-        std::shared_ptr<DataContextWithFlag> context(static_cast<DataContextWithFlag*>(work->data),
-            [](DataContextWithFlag* ptr) {
+    std::shared_ptr<DataContextWithFlag> context(
+        new DataContextWithFlag { env_, method, isValid, std::move(getter) },
+        [](DataContextWithFlag* ptr) {
             delete ptr;
             ptr = nullptr;
         });
+    CHECK_RETURN_VOID(context != nullptr, "no memory for uv_work_t");
+
+    auto task = [context] {
+        AVSESSION_TRACE_SYNC_START("NapiAsyncCallback::CallWithFlag");
         if (context == nullptr) {
             SLOGE("context is nullptr");
             return;
@@ -146,17 +150,21 @@ void NapiAsyncCallback::CallWithFunc(napi_ref& method, std::shared_ptr<bool> isV
 {
     CHECK_RETURN_VOID(loop_ != nullptr && method != nullptr, "loop_ or method is nullptr");
 
-    std::shared_ptr<uv_work_t> work = std::make_shared<uv_work_t>();
-    CHECK_RETURN_VOID(work != nullptr, "no memory for uv_work_t");
-
-    work->data = new DataContextWithFunc { env_, method, isValid, std::move(getter), checkCallbackValid };
-    auto task = [work] {
-        AVSESSION_TRACE_SYNC_START("NapiAsyncCallback::AfterWorkCallbackWithFunc");
-        std::shared_ptr<DataContextWithFunc> context(static_cast<DataContextWithFunc*>(work->data),
-            [](DataContextWithFunc* ptr) {
+    const napi_ref methodIdentity = method;
+    const uint64_t eventSequence = callbackEventSequence.fetch_add(1) + 1;
+    std::shared_ptr<DataContextWithFunc> context(
+        new DataContextWithFunc { env_, method, isValid, std::move(getter), checkCallbackValid },
+        [eventSequence, methodIdentity](DataContextWithFunc* ptr) {
             delete ptr;
             ptr = nullptr;
+            SLOGI("AVCallback release event=%{public}llu ref=%{public}p",
+                static_cast<unsigned long long>(eventSequence), static_cast<void*>(methodIdentity));
         });
+    CHECK_RETURN_VOID(context != nullptr, "no memory for uv_work_t");
+    auto task = [context, eventSequence, methodIdentity] {
+        AVSESSION_TRACE_SYNC_START("NapiAsyncCallback::AfterWorkCallbackWithFunc");
+        SLOGI("AVCallback begin event=%{public}llu ref=%{public}p",
+            static_cast<unsigned long long>(eventSequence), static_cast<void*>(methodIdentity));
 
         napi_handle_scope scope = nullptr;
         napi_open_handle_scope(context->env, &scope);
@@ -171,30 +179,48 @@ void NapiAsyncCallback::CallWithFunc(napi_ref& method, std::shared_ptr<bool> isV
 
         if (!(*context->isValid)) {
             SLOGE("AfterWorkCallbackWithFunc failed for context is invalid.");
+            SLOGI("AVCallback skip event=%{public}llu reason=object-invalid",
+                static_cast<unsigned long long>(eventSequence));
             napi_close_handle_scope(context->env, scope);
             return;
         }
         napi_value global {};
         napi_get_global(context->env, &global);
         napi_value function {};
+        SLOGI("AVCallback check event=%{public}llu phase=before-resolve",
+            static_cast<unsigned long long>(eventSequence));
         if (!context->checkCallbackValid()) {
             SLOGE("Get func reference failed for func has been deleted.");
+            SLOGI("AVCallback skip event=%{public}llu phase=before-resolve",
+                static_cast<unsigned long long>(eventSequence));
             napi_close_handle_scope(context->env, scope);
             return;
         }
         napi_get_reference_value(context->env, context->method, &function);
         napi_value result;
+        SLOGI("AVCallback check event=%{public}llu phase=before-invoke",
+            static_cast<unsigned long long>(eventSequence));
         if (!context->checkCallbackValid()) {
             SLOGE("Call func failed for func has been deleted.");
+            SLOGI("AVCallback skip event=%{public}llu phase=before-invoke",
+                static_cast<unsigned long long>(eventSequence));
             napi_close_handle_scope(context->env, scope);
             return;
         }
-        if (napi_status::napi_ok != napi_call_function(context->env, global, function, argc, argv, &result)) {
+        const napi_status callStatus = napi_call_function(context->env, global, function, argc, argv, &result);
+        SLOGI("AVCallback invoke-result event=%{public}llu ref=%{public}p status=%{public}d",
+            static_cast<unsigned long long>(eventSequence), static_cast<void*>(methodIdentity), callStatus);
+        if (napi_status::napi_ok != callStatus) {
             SLOGE("call function failed");
         }
         napi_close_handle_scope(context->env, scope);
     };
-    if (napi_status::napi_ok != napi_send_event(env_, task, napi_eprio_immediate, callbackName.c_str())) {
+    SLOGI("AVCallback submit event=%{public}llu ref=%{public}p",
+        static_cast<unsigned long long>(eventSequence), static_cast<void*>(methodIdentity));
+    const napi_status submitStatus = napi_send_event(env_, task, napi_eprio_immediate, callbackName.c_str());
+    SLOGI("AVCallback submit-result event=%{public}llu ref=%{public}p status=%{public}d",
+        static_cast<unsigned long long>(eventSequence), static_cast<void*>(methodIdentity), submitStatus);
+    if (napi_status::napi_ok != submitStatus) {
         SLOGE("CallWithFlag: napi_send_event fail");
     }
 }
